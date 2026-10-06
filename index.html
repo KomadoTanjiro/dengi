@@ -67,6 +67,11 @@
   .ghost{border:1px dashed #C6CDD7;background:none;border-radius:10px;padding:10px;width:100%;color:var(--muted);margin-top:4px}
   .status{font-size:12px;color:var(--muted);text-align:center;min-height:16px;margin-top:6px}
   .empty{text-align:center;color:var(--muted);padding:30px 10px}
+  .shift{display:block;font-size:12px;color:var(--warn)}
+  .excl{font-size:14px;color:var(--muted);margin-top:10px}
+  .excl button{border:none;background:none;color:var(--cobalt);font-weight:600;padding:2px 4px}
+  .ro{font-size:13px;color:var(--muted);margin:-2px 0 6px}
+  .tabs button{font-size:15px}
 </style>
 </head>
 <body>
@@ -78,7 +83,8 @@
   </div>
   <div class="tabs">
     <button data-tab="plan" class="on">План</button>
-    <button data-tab="edit">Данные месяца</button>
+    <button data-tab="month">Этот месяц</button>
+    <button data-tab="fixed">Постоянное</button>
   </div>
   <div id="view"></div>
   <div class="status" id="status"></div>
@@ -89,70 +95,135 @@ const pad = n => String(n).padStart(2,'0');
 const uid = () => Math.random().toString(36).slice(2,9);
 const fmt = n => new Intl.NumberFormat('ru-RU',{maximumFractionDigits:0}).format(Math.round(n||0)) + ' ₽';
 const r1k = x => Math.round(x/1000)*1000;
-const D = iso => new Date(iso+'T00:00:00');
+const D = iso => { const [y,m,d]=iso.split('-').map(Number); return new Date(y,m-1,d); };
+const ISO = dt => `${dt.getFullYear()}-${pad(dt.getMonth()+1)}-${pad(dt.getDate())}`;
 const days = (a,b) => Math.round((D(b)-D(a))/864e5);
 const longDate = iso => D(iso).toLocaleDateString('ru-RU',{day:'numeric',month:'long'});
 const shortDate = iso => D(iso).toLocaleDateString('ru-RU',{day:'2-digit',month:'2-digit'});
 const esc = s => String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const num = v => parseFloat(String(v).replace(',','.').replace(/\s/g,''))||0;
-function addMonth(iso){
-  if(!iso) return iso;
-  let [y,m,d] = iso.split('-').map(Number); m++; if(m>12){m=1;y++;}
-  return `${y}-${pad(m)}-${pad(Math.min(d,new Date(y,m,0).getDate()))}`;
-}
-
-const SEEDS = {};
-
-let ym = (()=>{ const t=new Date(); return `${t.getFullYear()}-${pad(t.getMonth()+1)}`; })();
-let S = null, tab = 'plan';
-const keyOf = k => 'moneyplan:'+k;
 const shiftYm = (k,n) => { let [y,m]=k.split('-').map(Number); m+=n; while(m>12){m-=12;y++;} while(m<1){m+=12;y--;} return `${y}-${pad(m)}`; };
-const setStatus = t => document.getElementById('status').textContent = t;
 
-async function getPlan(k){
-  try{ const v = localStorage.getItem(keyOf(k)); if(v) return JSON.parse(v); }catch(e){}
-  return null;
+/* ---------- производственный календарь РФ ---------- */
+const KNOWN_OFF = { // переносы по постановлениям Правительства
+  2026:['01-09','03-09','05-11','12-31'],
+  2027:['02-22','05-03','05-10','06-14','11-05','12-31']
+};
+const holCache = {};
+function holidays(y){
+  if(holCache[y]) return holCache[y];
+  const s = new Set();
+  for(let d=1; d<=8; d++) s.add(`${y}-01-${pad(d)}`);
+  ['02-23','03-08','05-01','05-09','06-12','11-04'].forEach(md=>{
+    s.add(`${y}-${md}`);
+    const dt = D(`${y}-${md}`), w = dt.getDay();
+    if(w===0||w===6){ dt.setDate(dt.getDate() + (w===6?2:1)); s.add(ISO(dt)); }
+  });
+  (KNOWN_OFF[y]||[]).forEach(md=>s.add(`${y}-${md}`));
+  return holCache[y] = s;
 }
-async function load(){
-  setStatus('Загрузка…');
-  let p = await getPlan(ym);
-  if(!p && SEEDS[ym]) p = JSON.parse(JSON.stringify(SEEDS[ym]));
-  if(!p){
-    const prevK = shiftYm(ym,-1);
-    let prev = await getPlan(prevK) || (SEEDS[prevK] ? JSON.parse(JSON.stringify(SEEDS[prevK])) : null);
-    if(prev){
-      p = JSON.parse(JSON.stringify(prev));
-      p.paydays.forEach(d=>d.date=addMonth(d.date));
-      p.payments.forEach(x=>x.deadline=addMonth(x.deadline));
-      p.endDate = addMonth(p.endDate); p.extra = 0; p.checks = {};
-    } else {
-      const s = `${ym}-15`;
-      p = {paydays:[{id:uid(),label:'Аванс',date:s,amount:0}], endDate:addMonth(s), extra:0, payments:[], card:{target:0,min:0,minPayday:'none'}, savings:0, checks:{}};
-    }
-  }
-  S = p; setStatus(''); render();
+function isOff(iso){
+  const dt = D(iso), w = dt.getDay();
+  return w===0 || w===6 || holidays(dt.getFullYear()).has(iso) || (SET.extraOff||[]).includes(iso);
 }
+function shiftBack(iso){ const dt = D(iso); let g=0; while(isOff(ISO(dt)) && g++<40) dt.setDate(dt.getDate()-1); return ISO(dt); }
+
+/* ---------- данные ---------- */
+const SEED_SETTINGS = {
+  startDay:15,
+  incomes:[
+    {id:'a1',label:'Аванс',day:15,amount:78000},
+    {id:'a2',label:'Аванс',day:20,amount:100000},
+    {id:'z1',label:'Зарплата',day:30,amount:102000},
+    {id:'z2',label:'Зарплата',day:5,amount:100000}],
+  recurring:[
+    {id:'p1',name:'Интернет',amount:5000,day:'',income:'a1'},
+    {id:'p2',name:'Коммуналка',amount:7000,day:25,income:'a1'},
+    {id:'p3',name:'Барбер',amount:4000,day:28,income:'auto'},
+    {id:'p4',name:'Сплит',amount:7000,day:4,income:'auto'},
+    {id:'p5',name:'Кредит',amount:10000,day:8,income:'auto'}],
+  extraOff:[]
+};
+const blankMonth = () => ({v:2, incomeAmt:{}, recAmt:{}, excluded:[], oneoff:[], extra:0, card:{target:0,min:0,minPayday:'none'}, savings:0, checks:{}});
+
+let SET = null, M = null, tab = 'plan';
+let ym = (()=>{ const t=new Date(); return `${t.getFullYear()}-${pad(t.getMonth()+1)}`; })();
+const keyOf = k => 'moneyplan:'+k;
+const setStatus = t => document.getElementById('status').textContent = t;
+const rd = k => { try{ const v=localStorage.getItem(k); return v?JSON.parse(v):null; }catch(e){ return null; } };
+const wr = (k,v) => { try{ localStorage.setItem(k,JSON.stringify(v)); return true; }catch(e){ return false; } };
+
+function migrate(old){ // старый формат месяца → новый
+  const m = blankMonth();
+  m.extra = old.extra||0; m.card = old.card||m.card; m.savings = old.savings||0; m.checks = old.checks||{};
+  (old.paydays||[]).forEach(p=>{ const t = SET.incomes.find(i=>i.id===p.id); if(t && num(p.amount)!==num(t.amount)) m.incomeAmt[p.id]=num(p.amount); });
+  const seen = new Set();
+  (old.payments||[]).forEach(x=>{
+    const t = SET.recurring.find(r=>r.id===x.id);
+    if(t){ seen.add(x.id); if(num(x.amount)!==num(t.amount)) m.recAmt[x.id]=num(x.amount); }
+    else m.oneoff.push({id:x.id,name:x.name,amount:num(x.amount),deadline:x.deadline||'',payday:x.payday||'auto'});
+  });
+  SET.recurring.forEach(r=>{ if(!seen.has(r.id)) m.excluded.push(r.id); });
+  return m;
+}
+
 let tmr;
 function save(){
   clearTimeout(tmr);
-  tmr = setTimeout(async()=>{
-    try{ localStorage.setItem(keyOf(ym), JSON.stringify(S)); setStatus('Сохранено'); }
-    catch(e){ setStatus('Не удалось сохранить'); }
-  },400);
+  tmr = setTimeout(()=>{ const ok = wr(keyOf('settings'),SET) && wr(keyOf(ym),M); setStatus(ok?'Сохранено':'Не удалось сохранить'); },350);
+}
+
+function load(){
+  SET = rd(keyOf('settings'));
+  if(!SET){ SET = JSON.parse(JSON.stringify(SEED_SETTINGS)); wr(keyOf('settings'),SET); }
+  let m = rd(keyOf(ym));
+  if(m && !m.v){ m = migrate(m); wr(keyOf(ym),m); }
+  if(!m){
+    m = blankMonth();
+    for(let i=1;i<=12;i++){ const p = rd(keyOf(shiftYm(ym,-i))); if(p){ const pm = p.v?p:migrate(p); m.card = {...pm.card}; m.savings = pm.savings; break; } }
+  }
+  M = m; render();
+}
+
+/* ---------- даты месяца ---------- */
+function nominal(k, day){
+  let [y,mo] = k.split('-').map(Number);
+  day = Math.max(1, Math.min(31, parseInt(day)||1));
+  if(day < (parseInt(SET.startDay)||1)){ mo++; if(mo>12){mo=1;y++;} }
+  return `${y}-${pad(mo)}-${pad(Math.min(day, new Date(y,mo,0).getDate()))}`;
+}
+function paydaysOf(k, mm){
+  return SET.incomes.filter(i=>i.day).map(i=>{
+    const nom = nominal(k,i.day);
+    return {id:i.id, label:i.label, nominal:nom, date:shiftBack(nom), amount: mm && mm.incomeAmt[i.id]!=null ? mm.incomeAmt[i.id] : num(i.amount)};
+  });
+}
+function endOf(k){ const n = paydaysOf(shiftYm(k,1)); return n.length ? n.map(p=>p.date).sort()[0] : nominal(shiftYm(k,1),SET.startDay); }
+function paymentsOf(k){
+  const rec = SET.recurring.filter(r=>!M.excluded.includes(r.id)).map(r=>({
+    id:r.id, name:r.name, recurring:true,
+    amount: M.recAmt[r.id]!=null ? M.recAmt[r.id] : num(r.amount),
+    deadline: r.day ? nominal(k,r.day) : '', payday: r.income||'auto'}));
+  return rec.concat(M.oneoff.map(x=>({...x, amount:num(x.amount)})));
 }
 
 /* ---------- расчёт ---------- */
 function compute(){
   const warns = [];
-  const pd = S.paydays.filter(d=>d.date).slice().sort((a,b)=>a.date.localeCompare(b.date));
-  if(!pd.length) return {pd:[],warns:['Добавьте хотя бы один приход денег.']};
-  const n = pd.length;
-  const P = pd.map(d=>({...d, pays:[], card:0, sav:0, live:0, keep:0, bonus:0}));
+  const raw = paydaysOf(ym, M).sort((a,b)=>a.date.localeCompare(b.date));
+  if(!raw.length) return {pd:[],warns:['Добавьте приходы во вкладке «Постоянное».']};
+  const P = [], gIdx = {};
+  raw.forEach(r=>{
+    let g = P.length && P[P.length-1].date===r.date ? P[P.length-1] : null;
+    if(!g){ g = {id:r.id, date:r.date, amount:0, parts:[], pays:[], card:0, sav:0, live:0, keep:0}; P.push(g); }
+    g.amount += num(r.amount); g.parts.push(r); gIdx[r.id] = P.indexOf(g);
+  });
+  const n = P.length;
+  const endDate = endOf(ym);
 
-  S.payments.forEach(x=>{
+  paymentsOf(ym).forEach(x=>{
     if(!num(x.amount)) return;
-    let idx = -1;
-    if(x.payday && x.payday!=='auto') idx = P.findIndex(d=>d.id===x.payday);
+    let idx = (x.payday && x.payday!=='auto' && gIdx[x.payday]!=null) ? gIdx[x.payday] : -1;
     if(idx<0 && x.deadline){
       for(let i=0;i<n;i++) if(P[i].date<=x.deadline) idx=i;
       if(idx<0){ idx=0; warns.push(`«${x.name}» нужно оплатить до ${shortDate(x.deadline)}, а первые деньги придут только ${shortDate(P[0].date)}.`); }
@@ -163,60 +234,90 @@ function compute(){
   });
 
   P.forEach((d,i)=>{
-    const to = i<n-1 ? P[i+1].date : S.endDate;
-    d.to = to; d.days = to ? days(d.date,to) : 0;
-    if(d.days<=0){ d.days = 1; if(i===n-1) warns.push('Дата «План до» должна быть позже последнего прихода.'); }
+    d.to = i<n-1 ? P[i+1].date : endDate;
+    d.days = Math.max(0, days(d.date,d.to));
+    if(i===n-1 && d.days<=0) d.days = 1;
     d.payTotal = d.pays.reduce((s,x)=>s+num(x.amount),0);
   });
 
-  const income = P.reduce((s,d)=>s+num(d.amount),0) + num(S.extra);
+  const income = P.reduce((s,d)=>s+d.amount,0) + num(M.extra);
   const pay = P.reduce((s,d)=>s+d.payTotal,0);
-  const cardT = num(S.card.target), savT = num(S.savings);
+  const cardT = num(M.card.target), savT = num(M.savings);
   let liveTotal = income - pay - cardT - savT;
   if(liveTotal<0){ warns.push(`Не хватает ${fmt(-liveTotal)}: уменьшите сумму на кредитку или «отложить».`); liveTotal = 0; }
 
-  const totDays = P.reduce((s,d)=>s+d.days,0);
-  let acc = 0;
-  P.forEach((d,i)=>{ d.live = i<n-1 ? r1k(liveTotal*d.days/totDays) : liveTotal-acc; acc += d.live; });
+  const avail = P.map((d,i)=> d.amount + (i===0?num(M.extra):0) - d.payTotal);
+  let s = 0, R = liveTotal;
+  while(s<n){
+    const dLeft = P.slice(s).reduce((t,d)=>t+d.days,0);
+    const rU = dLeft>0 ? R/dLeft : 0;
+    let cumA=0, cumD=0, best=Infinity, bk=-1;
+    for(let k=s;k<n-1;k++){
+      cumA+=avail[k]; cumD+=P[k].days;
+      const ratio = cumD>0 ? cumA/cumD : (cumA<0 ? -Infinity : Infinity);
+      if(ratio<best){ best=ratio; bk=k; }
+    }
+    let end, group;
+    if(bk>=0 && best<rU){
+      end = bk; const sumA = P.slice(s,end+1).reduce((t,d,j)=>t+avail[s+j],0); group = Math.max(0,sumA);
+      if(sumA<0) warns.push(`До ${shortDate(P[end].to)} платежей больше, чем денег: не хватает ${fmt(-sumA)}. Перенесите крупный платёж позже.`);
+    } else { end = n-1; group = R; }
+    const gD = P.slice(s,end+1).reduce((t,d)=>t+d.days,0);
+    let acc = 0;
+    for(let i=s;i<=end;i++){ P[i].live = i<end ? (gD>0 ? Math.floor(group*P[i].days/gD/1000)*1000 : 0) : group-acc; acc += P[i].live; }
+    R -= group; s = end+1;
+  }
 
-  // свободные деньги по приходам; если не хватает — оставляем с прошлого прихода
-  const free = P.map((d,i)=> num(d.amount) + (i===0?num(S.extra):0) - d.payTotal - d.live);
-  for(let i=n-1;i>0;i--){ if(free[i]<0){ free[i-1]+=free[i]; P[i-1].keep = -free[i]; free[i]=0; } }
-  if(free[0]<0){ warns.push(`Платежи и жизнь в начале месяца не покрываются: не хватает ${fmt(-free[0])}.`); P[0].live = Math.max(0,P[0].live+free[0]); free[0]=0; }
+  const free = P.map((d,i)=> avail[i] - d.live), free0 = free.slice();
+  const origin = P.map(()=>new Set());
+  for(let i=n-1;i>0;i--){
+    if(free[i]<0){ free[i-1]+=free[i]; P[i-1].keep = -free[i]; free[i]=0;
+      origin[i-1] = new Set([...origin[i-1], ...origin[i], ...(free0[i]<0?[i]:[])]); }
+  }
+  P.forEach((d,i)=>{
+    if(!d.keep) return;
+    const why = [...origin[i]].sort((x,y)=>x-y).map(j=>{
+      if(P[j].payTotal <= P[j].live) return null;
+      const big = P[j].pays.slice().sort((x,y)=>num(y.amount)-num(x.amount))[0];
+      return big ? `${String(big.name).trim()} ${shortDate(P[j].date)}` : null;
+    }).filter(Boolean);
+    d.keepWhy = why.length ? 'на ' + why.join(', ') : `на жизнь после ${shortDate(d.to)}`;
+  });
+  if(free[0]<0){ P[0].live = Math.max(0,P[0].live+free[0]); free[0]=0; }
 
   let remC = cardT, remS = savT, cardSoFar = 0;
-  const minIdx = P.findIndex(d=>d.id===S.card.minPayday);
+  const minIdx = gIdx[M.card.minPayday]!=null ? gIdx[M.card.minPayday] : -1;
   P.forEach((d,i)=>{
     const f = free[i];
-    let need = (i===minIdx) ? Math.max(0, num(S.card.min)-cardSoFar) : 0;
+    let need = (i===minIdx) ? Math.max(0, num(M.card.min)-cardSoFar) : 0;
     need = Math.min(need, f, remC);
-    let c, s;
-    if(i===n-1){ c = Math.min(remC,f); s = Math.min(remS, f-c); }
+    let c, sv;
+    if(i===n-1){ c = Math.min(remC,f); sv = Math.min(remS, f-c); }
     else{
       const rest = f-need, cl = remC-need, tot = cl+remS;
       c = need + (tot>0 ? r1k(rest*cl/tot) : 0);
       c = Math.max(need, Math.min(c, remC, f));
-      s = Math.min(remS, f-c);
+      sv = Math.min(remS, f-c);
     }
-    d.card=c; d.sav=s; d.bonus = f-c-s; d.live += d.bonus;
-    remC-=c; remS-=s; cardSoFar+=c;
+    d.card=c; d.sav=sv; d.live += f-c-sv;
+    remC-=c; remS-=sv; cardSoFar+=c;
   });
-  if(minIdx>=0 && num(S.card.min) && P.slice(0,minIdx+1).reduce((s,d)=>s+d.card,0) < num(S.card.min))
+  if(minIdx>=0 && num(M.card.min) && P.slice(0,minIdx+1).reduce((t,d)=>t+d.card,0) < num(M.card.min))
     warns.push(`К ${shortDate(P[minIdx].date)} не получается внести обязательный платёж по кредитке целиком.`);
   if(remC>0.5) warns.push(`На кредитку не хватает ${fmt(remC)}.`);
   if(remS>0.5) warns.push(`Отложить получается на ${fmt(remS)} меньше цели.`);
 
-  const live = P.reduce((s,d)=>s+d.live,0);
-  return {pd:P, warns, income, pay, cardT, savT, live, perDay: live/totDays};
+  const live = P.reduce((t,d)=>t+d.live,0), totD = Math.max(1,P.reduce((t,d)=>t+d.days,0));
+  return {pd:P, warns, income, pay, cardT, savT, live, perDay: live/totD};
 }
 
-/* ---------- экран плана ---------- */
-function renderPlan(){
-  const R = compute(), V = document.getElementById('view');
-  if(!R.pd.length){ V.innerHTML = `<div class="empty">Заполните вкладку «Данные месяца».</div>`; return; }
-  const chk = k => S.checks[k] ? 'checked' : '';
-  const item = (k,name,sub,v) => `<label class="item ${S.checks[k]?'done':''}"><input type="checkbox" data-k="${k}" ${chk(k)}>
+/* ---------- экран «План» ---------- */
+function renderPlan(V){
+  const R = compute();
+  if(!R.pd.length){ V.innerHTML = `<div class="empty">${esc(R.warns[0])}</div>`; return; }
+  const item = (k,name,sub,v) => `<label class="item ${M.checks[k]?'done':''}"><input type="checkbox" data-k="${k}" ${M.checks[k]?'checked':''}>
       <span class="nm">${esc(name)}${sub?`<small>${sub}</small>`:''}</span><span class="v">${fmt(v)}</span></label>`;
+  const perDay = (live,d) => d ? `${d} дн., ≈ ${fmt(Math.round(live/d/100)*100)} в день` : '';
   V.innerHTML = `
     <div class="sum">
       <div>Приход<b>${fmt(R.income)}</b></div>
@@ -230,98 +331,107 @@ function renderPlan(){
     ${R.pd.map((d,i)=>`
       <div class="day">
         <h2>${longDate(d.date)}</h2>
-        <div class="in">${esc(d.label||'Приход')}: <b>+${fmt(d.amount)}</b>${i===0&&num(S.extra)?`, плюс на руках ${fmt(S.extra)}`:''}</div>
+        ${d.parts.map(p=>`<div class="in">${esc(p.label||'Приход')}: <b>+${fmt(p.amount)}</b>${p.date!==p.nominal?`<span class="shift">перенесено с ${shortDate(p.nominal)} — выходной или праздник</span>`:''}</div>`).join('')}
+        ${i===0&&num(M.extra)?`<div class="in">Уже на руках: <b>+${fmt(M.extra)}</b></div>`:''}
         ${d.pays.map(x=>item('p:'+x.id, x.name, x.deadline?`до ${shortDate(x.deadline)}`:'', x.amount)).join('')}
-        ${d.card?item('c:'+d.id,'На кредитку', (S.card.minPayday===d.id&&num(S.card.min))?`включая обязательный платёж ${fmt(S.card.min)}`:'', d.card):''}
+        ${d.card?item('c:'+d.id,'На кредитку', (minIdxOf()===i&&num(M.card.min))?`включая обязательный платёж ${fmt(M.card.min)}`:'', d.card):''}
         ${d.sav?item('s:'+d.id,'Отложить','на отдельный счёт',d.sav):''}
-        ${d.keep?`<div class="item keep"><span class="nm">Не трогать, оставить<small>понадобится после ${shortDate(d.to)}</small></span><span class="v">${fmt(d.keep)}</span></div>`:''}
-        <div class="live-line"><span>На жизнь до ${shortDate(d.to)}<small>${d.days} дн., ≈ ${fmt(Math.round(d.live/d.days/100)*100)} в день</small></span><b>${fmt(d.live)}</b></div>
+        ${d.keep?`<div class="item keep"><span class="nm">Не тратить, оставить<small>${esc(d.keepWhy)}</small></span><span class="v">${fmt(d.keep)}</span></div>`:''}
+        <div class="live-line"><span>На жизнь до ${shortDate(d.to)}<small>${perDay(d.live,d.days)}</small></span><b>${fmt(d.live)}</b></div>
       </div>`).join('')}`;
+  function minIdxOf(){ return R.pd.findIndex(g=>g.parts.some(p=>p.id===M.card.minPayday)); }
   V.querySelectorAll('[data-k]').forEach(c=>c.onchange=()=>{
-    if(c.checked) S.checks[c.dataset.k]=true; else delete S.checks[c.dataset.k];
+    if(c.checked) M.checks[c.dataset.k]=true; else delete M.checks[c.dataset.k];
     c.closest('.item').classList.toggle('done',c.checked); save();
   });
 }
 
-/* ---------- экран данных ---------- */
-function renderEdit(){
-  const V = document.getElementById('view');
-  const pdSorted = S.paydays.slice().sort((a,b)=>(a.date||'').localeCompare(b.date||''));
-  const pdOpts = (sel,first) => first + pdSorted.map(d=>`<option value="${d.id}" ${sel===d.id?'selected':''}>${d.date?shortDate(d.date):'?'} ${esc(d.label)}</option>`).join('');
+/* ---------- общие кусочки форм ---------- */
+const incomeOpts = (sel, first) => first + SET.incomes.map(i=>`<option value="${i.id}" ${sel===i.id?'selected':''}>${esc(i.label)} ${i.day?i.day+'-го':''}</option>`).join('');
+
+/* ---------- экран «Этот месяц» ---------- */
+function renderMonth(V){
+  const pds = paydaysOf(ym, M);
+  const recOn = SET.recurring.filter(r=>!M.excluded.includes(r.id));
+  const recOff = SET.recurring.filter(r=>M.excluded.includes(r.id));
   V.innerHTML = `
     <div class="sec">
-      <h3>Приходы денег</h3>
-      <p class="hint">Пишите сумму, которая реально придёт на карту.</p>
-      ${S.paydays.map(d=>`<div class="entry"><div class="top">
-          <label class="f">Название<input data-pd="${d.id}" data-f="label" value="${esc(d.label)}"></label>
-          <button class="del" data-delpd="${d.id}" aria-label="Удалить приход">×</button></div>
-        <div class="grid2"><label class="f">Дата<input type="date" data-pd="${d.id}" data-f="date" value="${d.date||''}"></label>
-          <label class="f">Сумма<input inputmode="decimal" data-pd="${d.id}" data-f="amount" value="${d.amount||''}" placeholder="0"></label></div></div>`).join('')}
-      <button class="ghost" id="addPd">+ Добавить приход</button>
-      <div class="grid2" style="margin-top:12px">
-        <label class="f">Уже есть на руках<input inputmode="decimal" id="extra" value="${S.extra||''}" placeholder="0"></label>
-        <label class="f">План до (след. аванс)<input type="date" id="endDate" value="${S.endDate||''}"></label>
-      </div>
+      <h3>Приходы в этом месяце</h3>
+      <p class="hint">Даты считаются сами. Сумму можно поменять только для этого месяца.</p>
+      ${pds.map(p=>`<div class="entry">
+        <div class="grid2"><div><b>${esc(p.label)}</b><div class="ro">${longDate(p.date)}${p.date!==p.nominal?`<span class="shift">перенесено с ${shortDate(p.nominal)}</span>`:''}</div></div>
+        <label class="f">Сумма<input inputmode="decimal" data-inc="${p.id}" value="${p.amount||''}" placeholder="0"></label></div></div>`).join('')}
+      <label class="f" style="margin-top:10px">Уже есть на руках к началу<input inputmode="decimal" id="extra" value="${M.extra||''}" placeholder="0"></label>
     </div>
 
     <div class="sec">
-      <h3>Обязательные платежи</h3>
-      <p class="hint">Укажите срок — план сам поставит платёж на последний приход перед ним. Или выберите приход вручную.</p>
-      ${S.payments.map(x=>`<div class="entry"><div class="top">
-          <label class="f">Что<input data-py="${x.id}" data-f="name" value="${esc(x.name)}"></label>
-          <button class="del" data-delpy="${x.id}" aria-label="Удалить платёж">×</button></div>
-        <div class="grid2"><label class="f">Сумма<input inputmode="decimal" data-py="${x.id}" data-f="amount" value="${x.amount||''}" placeholder="0"></label>
-          <label class="f">Оплатить до<input type="date" data-py="${x.id}" data-f="deadline" value="${x.deadline||''}"></label></div>
-        <label class="f">С какого прихода<select data-py="${x.id}" data-f="payday">${pdOpts(x.payday,`<option value="auto" ${x.payday==='auto'?'selected':''}>Автоматически</option>`)}</select></label></div>`).join('')}
-      <button class="ghost" id="addPy">+ Добавить платёж</button>
+      <h3>Постоянные платежи</h3>
+      <p class="hint">Приходят из вкладки «Постоянное». Сумму можно поменять на этот месяц, крестик убирает платёж только из этого месяца.</p>
+      ${recOn.map(r=>{ const amt = M.recAmt[r.id]!=null?M.recAmt[r.id]:r.amount; return `<div class="entry"><div class="top">
+        <label class="f">${esc(r.name)}${r.day?` · до ${shortDate(nominal(ym,r.day))}`:''}<input inputmode="decimal" data-rec="${r.id}" value="${amt||''}" placeholder="0"></label>
+        <button class="del" data-ex="${r.id}" aria-label="Убрать в этом месяце">×</button></div></div>`; }).join('') || '<p class="hint">Нет постоянных платежей.</p>'}
+      ${recOff.length?`<div class="excl">Убраны в этом месяце: ${recOff.map(r=>`${esc(r.name)} <button data-back="${r.id}">вернуть</button>`).join(', ')}</div>`:''}
+    </div>
+
+    <div class="sec">
+      <h3>Разовые платежи</h3>
+      <p class="hint">Только в этом месяце: покупки, долги и т. п.</p>
+      ${M.oneoff.map(x=>`<div class="entry"><div class="top">
+          <label class="f">Что<input data-oo="${x.id}" data-f="name" value="${esc(x.name)}"></label>
+          <button class="del" data-deloo="${x.id}" aria-label="Удалить">×</button></div>
+        <div class="grid2"><label class="f">Сумма<input inputmode="decimal" data-oo="${x.id}" data-f="amount" value="${x.amount||''}" placeholder="0"></label>
+          <label class="f">Оплатить до<input type="date" data-oo="${x.id}" data-f="deadline" value="${x.deadline||''}"></label></div>
+        <label class="f">С какого прихода<select data-oo="${x.id}" data-f="payday">${incomeOpts(x.payday,`<option value="auto" ${x.payday==='auto'?'selected':''}>Автоматически</option>`)}</select></label></div>`).join('')}
+      <button class="ghost" id="addOo">+ Добавить разовый платёж</button>
     </div>
 
     <div class="sec">
       <h3>Кредитка</h3>
-      <p class="hint">Общая сумма, которую нужно внести за месяц. Обязательный платёж входит в неё.</p>
-      <div class="grid2"><label class="f">Внести всего<input inputmode="decimal" id="cardT" value="${S.card.target||''}" placeholder="0"></label>
-        <label class="f">Обязательный платёж<input inputmode="decimal" id="cardM" value="${S.card.min||''}" placeholder="0"></label></div>
-      <label class="f">Обязательный внести не позже прихода<select id="cardP">${pdOpts(S.card.minPayday,`<option value="none" ${S.card.minPayday==='none'?'selected':''}>Не важно</option>`)}</select></label>
+      <p class="hint">Сколько внести за месяц. Обязательный платёж входит в эту сумму.</p>
+      <div class="grid2"><label class="f">Внести всего<input inputmode="decimal" id="cardT" value="${M.card.target||''}" placeholder="0"></label>
+        <label class="f">Обязательный платёж<input inputmode="decimal" id="cardM" value="${M.card.min||''}" placeholder="0"></label></div>
+      <label class="f">Обязательный внести не позже<select id="cardP">${incomeOpts(M.card.minPayday,`<option value="none" ${M.card.minPayday==='none'?'selected':''}>Не важно</option>`)}</select></label>
     </div>
 
     <div class="sec">
       <h3>Отложить</h3>
-      <label class="f">Сколько отложить за месяц<input inputmode="decimal" id="sav" value="${S.savings||''}" placeholder="0"></label>
+      <label class="f">Сколько отложить за месяц<input inputmode="decimal" id="sav" value="${M.savings||''}" placeholder="0"></label>
     </div>
+
     <button class="ghost" id="resetChecks">Снять все галочки в этом месяце</button>
 
     <div class="sec" style="margin-top:12px">
       <h3>Резервная копия</h3>
-      <p class="hint">Данные хранятся только на этом телефоне. Время от времени копируйте их в Заметки, чтобы не потерять.</p>
+      <p class="hint">Данные хранятся только на этом телефоне. Время от времени копируйте их в Заметки.</p>
       <button class="primary" id="exportB">Скопировать все данные</button>
       <textarea id="backup" rows="4" placeholder="Вставьте сюда резервную копию" style="width:100%;margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:9px 11px;font-size:14px;font-family:inherit"></textarea>
       <button class="ghost" id="importB">Восстановить из копии</button>
     </div>`;
 
-  const isNum = f => ['amount'].includes(f);
-  V.querySelectorAll('[data-pd]').forEach(i=>i.oninput=i.onchange=()=>{
-    const d = S.paydays.find(x=>x.id===i.dataset.pd); d[i.dataset.f] = isNum(i.dataset.f)?num(i.value):i.value; save();
+  V.querySelectorAll('[data-inc]').forEach(i=>i.oninput=()=>{
+    const t = SET.incomes.find(x=>x.id===i.dataset.inc), v = num(i.value);
+    if(v===num(t.amount)) delete M.incomeAmt[t.id]; else M.incomeAmt[t.id]=v; save();
   });
-  V.querySelectorAll('[data-py]').forEach(i=>i.oninput=i.onchange=()=>{
-    const x = S.payments.find(y=>y.id===i.dataset.py); x[i.dataset.f] = isNum(i.dataset.f)?num(i.value):i.value; save();
+  V.querySelectorAll('[data-rec]').forEach(i=>i.oninput=()=>{
+    const t = SET.recurring.find(x=>x.id===i.dataset.rec), v = num(i.value);
+    if(v===num(t.amount)) delete M.recAmt[t.id]; else M.recAmt[t.id]=v; save();
   });
-  V.querySelectorAll('[data-delpd]').forEach(b=>b.onclick=()=>{
-    const id=b.dataset.delpd; S.paydays=S.paydays.filter(d=>d.id!==id);
-    S.payments.forEach(x=>{ if(x.payday===id) x.payday='auto'; }); if(S.card.minPayday===id) S.card.minPayday='none';
-    save(); renderEdit();
+  V.querySelectorAll('[data-ex]').forEach(b=>b.onclick=()=>{ M.excluded.push(b.dataset.ex); save(); renderMonth(V); });
+  V.querySelectorAll('[data-back]').forEach(b=>b.onclick=()=>{ M.excluded=M.excluded.filter(x=>x!==b.dataset.back); save(); renderMonth(V); });
+  V.querySelectorAll('[data-oo]').forEach(i=>i.oninput=i.onchange=()=>{
+    const x = M.oneoff.find(y=>y.id===i.dataset.oo); x[i.dataset.f] = i.dataset.f==='amount'?num(i.value):i.value; save();
   });
-  V.querySelectorAll('[data-delpy]').forEach(b=>b.onclick=()=>{ S.payments=S.payments.filter(x=>x.id!==b.dataset.delpy); save(); renderEdit(); });
-  addPd.onclick=()=>{ const last=pdSorted[pdSorted.length-1]; S.paydays.push({id:uid(),label:'Приход',date:last?.date||'',amount:0}); save(); renderEdit(); };
-  addPy.onclick=()=>{ S.payments.push({id:uid(),name:'Новый платёж',amount:0,deadline:'',payday:'auto'}); save(); renderEdit();
+  V.querySelectorAll('[data-deloo]').forEach(b=>b.onclick=()=>{ M.oneoff=M.oneoff.filter(x=>x.id!==b.dataset.deloo); save(); renderMonth(V); });
+  addOo.onclick=()=>{ M.oneoff.push({id:uid(),name:'Новый платёж',amount:0,deadline:'',payday:'auto'}); save(); renderMonth(V);
     const ins=V.querySelectorAll('[data-f="name"]'); ins[ins.length-1].select(); };
-  extra.oninput=()=>{S.extra=num(extra.value);save();};
-  endDate.onchange=()=>{S.endDate=endDate.value;save();};
-  cardT.oninput=()=>{S.card.target=num(cardT.value);save();};
-  cardM.oninput=()=>{S.card.min=num(cardM.value);save();};
-  cardP.onchange=()=>{S.card.minPayday=cardP.value;save();};
-  sav.oninput=()=>{S.savings=num(sav.value);save();};
-  resetChecks.onclick=()=>{ S.checks={}; save(); setStatus('Галочки сняты'); };
+  extra.oninput=()=>{M.extra=num(extra.value);save();};
+  cardT.oninput=()=>{M.card.target=num(cardT.value);save();};
+  cardM.oninput=()=>{M.card.min=num(cardM.value);save();};
+  cardP.onchange=()=>{M.card.minPayday=cardP.value;save();};
+  sav.oninput=()=>{M.savings=num(sav.value);save();};
+  resetChecks.onclick=()=>{ M.checks={}; save(); setStatus('Галочки сняты'); };
   exportB.onclick=async()=>{
+    clearTimeout(tmr); wr(keyOf('settings'),SET); wr(keyOf(ym),M);
     const o={}; for(let i=0;i<localStorage.length;i++){ const k=localStorage.key(i); if(k.startsWith('moneyplan:')) o[k]=JSON.parse(localStorage.getItem(k)); }
     const t=JSON.stringify(o);
     try{ await navigator.clipboard.writeText(t); setStatus('Скопировано, вставьте в Заметки'); }
@@ -332,20 +442,82 @@ function renderEdit(){
       const o=JSON.parse(backup.value.trim()); let n=0;
       for(const k in o){ if(k.startsWith('moneyplan:')){ localStorage.setItem(k,JSON.stringify(o[k])); n++; } }
       if(!n) throw 0;
-      setStatus('Восстановлено месяцев: '+n); backup.value=''; load();
+      setStatus('Восстановлено записей: '+n); backup.value=''; load();
     }catch(e){ setStatus('Не получилось: проверьте, что вставлен текст копии целиком'); }
   };
+}
+
+/* ---------- экран «Постоянное» ---------- */
+function renderFixed(V){
+  V.innerHTML = `
+    <div class="sec">
+      <h3>Приходы каждый месяц</h3>
+      <p class="hint">Если день выпадает на выходной или праздник, деньги придут в последний рабочий день перед ним — форма учитывает это сама.</p>
+      ${SET.incomes.map(i=>`<div class="entry"><div class="top">
+          <label class="f">Название<input data-in="${i.id}" data-f="label" value="${esc(i.label)}"></label>
+          <button class="del" data-delin="${i.id}" aria-label="Удалить приход">×</button></div>
+        <div class="grid2"><label class="f">Число месяца<input inputmode="numeric" data-in="${i.id}" data-f="day" value="${i.day||''}" placeholder="1–31"></label>
+          <label class="f">Обычная сумма<input inputmode="decimal" data-in="${i.id}" data-f="amount" value="${i.amount||''}" placeholder="0"></label></div></div>`).join('')}
+      <button class="ghost" id="addIn">+ Добавить приход</button>
+      <label class="f" style="margin-top:12px">Месяц в плане начинается с числа<input inputmode="numeric" id="startDay" value="${SET.startDay||''}" placeholder="15"></label>
+      <p class="hint" style="margin:0">Например, 15: план «декабря» — с 15 декабря по 14 января. Приходы с числом меньше — это уже следующий календарный месяц.</p>
+    </div>
+
+    <div class="sec">
+      <h3>Постоянные платежи</h3>
+      <p class="hint">Появляются в каждом месяце. Убрать платёж из конкретного месяца можно во вкладке «Этот месяц».</p>
+      ${SET.recurring.map(r=>`<div class="entry"><div class="top">
+          <label class="f">Что<input data-rc="${r.id}" data-f="name" value="${esc(r.name)}"></label>
+          <button class="del" data-delrc="${r.id}" aria-label="Удалить платёж">×</button></div>
+        <div class="grid2"><label class="f">Сумма<input inputmode="decimal" data-rc="${r.id}" data-f="amount" value="${r.amount||''}" placeholder="0"></label>
+          <label class="f">Оплатить до числа<input inputmode="numeric" data-rc="${r.id}" data-f="day" value="${r.day||''}" placeholder="без срока"></label></div>
+        <label class="f">С какого прихода<select data-rc="${r.id}" data-f="income">${incomeOpts(r.income,`<option value="auto" ${r.income==='auto'?'selected':''}>Автоматически</option>`)}</select></label></div>`).join('')}
+      <button class="ghost" id="addRc">+ Добавить постоянный платёж</button>
+    </div>
+
+    <div class="sec">
+      <h3>Дополнительные выходные</h3>
+      <p class="hint">Праздники РФ и переносы на 2026–2027 уже учтены. Сюда — если появится что-то ещё (например, региональный праздник).</p>
+      ${(SET.extraOff||[]).map(d=>`<div class="item"><span class="nm">${longDate(d)} ${d.slice(0,4)}</span><button class="del" style="padding:0 4px" data-deloff="${d}" aria-label="Удалить">×</button></div>`).join('')}
+      <div class="row" style="display:flex;gap:8px;margin-top:8px"><input type="date" id="offDate"><button class="primary" style="width:auto" id="addOff">Добавить</button></div>
+    </div>`;
+
+  const numF = ['amount','day'];
+  V.querySelectorAll('[data-in]').forEach(i=>i.oninput=()=>{
+    const x = SET.incomes.find(y=>y.id===i.dataset.in), f=i.dataset.f;
+    x[f] = numF.includes(f) ? (f==='day' ? Math.min(31,parseInt(i.value)||'') : num(i.value)) : i.value; save();
+  });
+  V.querySelectorAll('[data-rc]').forEach(i=>i.oninput=i.onchange=()=>{
+    const x = SET.recurring.find(y=>y.id===i.dataset.rc), f=i.dataset.f;
+    x[f] = numF.includes(f) ? (f==='day' ? (Math.min(31,parseInt(i.value))||'') : num(i.value)) : i.value; save();
+  });
+  V.querySelectorAll('[data-delin]').forEach(b=>b.onclick=()=>{
+    if(!confirm('Удалить этот приход из всех месяцев?')) return;
+    const id=b.dataset.delin; SET.incomes=SET.incomes.filter(x=>x.id!==id);
+    SET.recurring.forEach(r=>{ if(r.income===id) r.income='auto'; }); save(); renderFixed(V);
+  });
+  V.querySelectorAll('[data-delrc]').forEach(b=>b.onclick=()=>{
+    if(!confirm('Удалить этот платёж из всех месяцев? Чтобы убрать только из одного месяца, используйте вкладку «Этот месяц».')) return;
+    SET.recurring=SET.recurring.filter(x=>x.id!==b.dataset.delrc); save(); renderFixed(V);
+  });
+  addIn.onclick=()=>{ SET.incomes.push({id:uid(),label:'Приход',day:'',amount:0}); save(); renderFixed(V); };
+  addRc.onclick=()=>{ SET.recurring.push({id:uid(),name:'Новый платёж',amount:0,day:'',income:'auto'}); save(); renderFixed(V);
+    const ins=V.querySelectorAll('[data-rc][data-f="name"]'); ins[ins.length-1].select(); };
+  startDay.oninput=()=>{ SET.startDay = Math.min(31,parseInt(startDay.value)||1); save(); };
+  V.querySelectorAll('[data-deloff]').forEach(b=>b.onclick=()=>{ SET.extraOff=SET.extraOff.filter(d=>d!==b.dataset.deloff); save(); renderFixed(V); });
+  addOff.onclick=()=>{ const v=offDate.value; if(!v) return; SET.extraOff=[...new Set([...(SET.extraOff||[]),v])].sort(); save(); renderFixed(V); };
 }
 
 function render(){
   const [y,m] = ym.split('-').map(Number);
   document.getElementById('title').textContent = new Date(y,m-1,1).toLocaleDateString('ru-RU',{month:'long',year:'numeric'}).replace(' г.','');
   document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('on',b.dataset.tab===tab));
-  tab==='plan' ? renderPlan() : renderEdit();
+  const V = document.getElementById('view');
+  tab==='plan' ? renderPlan(V) : tab==='month' ? renderMonth(V) : renderFixed(V);
 }
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{ tab=b.dataset.tab; render(); window.scrollTo(0,0); });
-prev.onclick=()=>{ ym=shiftYm(ym,-1); load(); };
-next.onclick=()=>{ ym=shiftYm(ym,1); load(); };
+prev.onclick=()=>{ clearTimeout(tmr); wr(keyOf(ym),M); ym=shiftYm(ym,-1); load(); };
+next.onclick=()=>{ clearTimeout(tmr); wr(keyOf(ym),M); ym=shiftYm(ym,1); load(); };
 load();
 </script>
 </body>
